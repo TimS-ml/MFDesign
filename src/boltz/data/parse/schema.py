@@ -1,3 +1,35 @@
+"""Input parsing module for converting YAML/JSON input schemas into internal data structures.
+
+This module implements the primary parsing pipeline that transforms user-provided input
+files (YAML or JSON format) into the internal ``Target`` data structure used by the Boltz
+model. The pipeline handles three major entity types:
+
+1. **Polymers** (protein, DNA, RNA) -- parsed via ``parse_polymer``, which converts
+   one-letter-code sequences into lists of ``ParsedResidue`` objects. Each residue is
+   populated with reference atom coordinates from the CCD (Chemical Component Dictionary),
+   and standard tokens are assigned from the vocabulary defined in ``boltz.data.const``.
+
+2. **Non-polymers / Ligands** -- parsed via ``parse_ccd_residue`` (for CCD codes) or
+   from SMILES strings. RDKit is used to resolve atom ordering, generate 3-D conformers,
+   and extract bond information.
+
+3. **Constraints** -- optional bond and pocket constraints specified in the input schema
+   are resolved against the parsed atom index map.
+
+The top-level entry point is ``parse_boltz_schema``, which orchestrates the full conversion
+from a raw schema dictionary to a ``Target`` object (structure + metadata record).
+
+Intermediate representations
+----------------------------
+- ``ParsedAtom``    : single atom with name, element, coordinates, and chirality.
+- ``ParsedBond``    : covalent bond between two atoms within a residue.
+- ``ParsedResidue`` : one residue (standard or CCD), owning its atoms and intra-residue bonds.
+- ``ParsedChain``   : one polymer or non-polymer chain, owning its residues.
+
+These intermediate objects are converted into NumPy structured arrays (``Atom``, ``Bond``,
+``Residue``, ``Chain``, etc.) at the end of the pipeline inside ``parse_boltz_schema``.
+"""
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
@@ -31,7 +63,36 @@ from boltz.data.types import (
 
 @dataclass(frozen=True)
 class ParsedAtom:
-    """A parsed atom object."""
+    """A single parsed atom, produced during input schema parsing.
+
+    This is an intermediate representation that holds all per-atom information
+    extracted from the CCD reference molecule (or SMILES-derived molecule).
+    It is later packed into the NumPy structured array ``Atom`` defined in
+    ``boltz.data.types``.
+
+    Attributes
+    ----------
+    name : str
+        PDB-style atom name (e.g. "CA", "CB", "N").
+    element : int
+        Atomic number from the periodic table (e.g. 6 for carbon).
+    charge : int
+        Formal charge of the atom.
+    coords : tuple[float, float, float]
+        3-D coordinates from the experimental structure.  Set to (0, 0, 0)
+        when parsing from sequence alone (no PDB coordinates available).
+    conformer : tuple[float, float, float]
+        Reference 3-D coordinates from the CCD ideal/computed conformer,
+        used as the initial frame for structure prediction.
+    is_present : bool
+        Whether the atom is experimentally resolved.  Always True when
+        parsing from sequence input.
+    chirality : int
+        Encoded chirality type index (see ``const.chirality_type_ids``).
+    is_spec_atom : bool
+        Whether this atom belongs to a residue marked for special treatment
+        (e.g. design / masking) via the ``spec_mask`` field in the input.
+    """
 
     name: str
     element: int
@@ -45,7 +106,23 @@ class ParsedAtom:
 
 @dataclass(frozen=True)
 class ParsedBond:
-    """A parsed bond object."""
+    """A single parsed covalent bond between two atoms within the same residue.
+
+    Bond objects are only produced for non-standard (CCD) residues parsed by
+    ``parse_ccd_residue``.  Standard polymer residues (protein/DNA/RNA) do not
+    carry intra-residue bond information because their topology is implicit.
+
+    Attributes
+    ----------
+    atom_1 : int
+        Local (residue-relative) index of the first bonded atom.
+    atom_2 : int
+        Local (residue-relative) index of the second bonded atom.
+        Convention: atom_1 < atom_2.
+    type : int
+        Bond type index (see ``const.bond_type_ids``):
+        0 = OTHER, 1 = SINGLE, 2 = DOUBLE, 3 = TRIPLE, 4 = AROMATIC.
+    """
 
     atom_1: int
     atom_2: int
@@ -54,7 +131,47 @@ class ParsedBond:
 
 @dataclass(frozen=True)
 class ParsedResidue:
-    """A parsed residue object."""
+    """A single parsed residue (standard amino acid / nucleotide, or CCD component).
+
+    For standard residues the atom list follows the canonical ordering defined in
+    ``const.ref_atoms`` and no bonds are stored.  For non-standard CCD residues
+    the atom list mirrors the RDKit molecule atom ordering and intra-residue bonds
+    are explicitly recorded.
+
+    Attributes
+    ----------
+    name : str
+        Residue name -- a three-letter code for amino acids (e.g. "ALA"),
+        one- or two-letter code for nucleotides (e.g. "DA"), or a CCD
+        component identifier for ligands (e.g. "ATP").
+    type : int
+        Token vocabulary index from ``const.token_ids``.  Non-standard
+        residues are assigned the ``UNK`` protein token index.
+    idx : int
+        Zero-based residue index within its parent chain.
+    atoms : list[ParsedAtom]
+        Ordered list of heavy atoms belonging to this residue.
+    bonds : list[ParsedBond]
+        Intra-residue covalent bonds.  Empty for standard polymer residues.
+    orig_idx : int or None
+        Original PDB residue index, if available.  None when parsing from
+        sequence input.
+    atom_center : int
+        Residue-local index of the center atom (CA for protein, C1' for
+        nucleotides).  Used for pairwise distance calculations.
+    atom_disto : int
+        Residue-local index of the distogram atom (CB for protein -- CA for
+        GLY, base atom for nucleotides).  Used for distogram predictions.
+    is_standard : bool
+        True if the residue is in the standard token vocabulary; False for
+        CCD / modified residues.
+    is_present : bool
+        Whether the residue has resolved coordinates.  Always True when
+        parsing from sequence.
+    is_spec_residue : bool
+        Whether this residue is flagged by the ``spec_mask`` in the input
+        (e.g. for antibody CDR design regions).
+    """
 
     name: str
     type: int
@@ -71,12 +188,28 @@ class ParsedResidue:
 
 @dataclass(frozen=True)
 class ParsedChain:
-    """A parsed chain object."""
+    """A parsed molecular chain (polymer or non-polymer).
+
+    A ``ParsedChain`` groups all residues that belong to one chain of a
+    biological assembly.  Multiple chain names can map to the same
+    ``ParsedChain`` instance when the input specifies symmetric copies
+    (e.g. ``id: [B, C]``).
+
+    Attributes
+    ----------
+    entity : str
+        Entity identifier (an integer cast to string) that groups chains
+        sharing the same sequence.  Symmetric copies share the same entity.
+    type : str
+        Chain / molecule type index from ``const.chain_type_ids``:
+        0 = PROTEIN, 1 = DNA, 2 = RNA, 3 = NONPOLYMER.
+    residues : list[ParsedResidue]
+        Ordered list of residues in this chain.
+    """
 
     entity: str
     type: str
     residues: list[ParsedResidue]
-    # residues: a list of ParsedResidue objects
 
 
 ####################################################################################################
@@ -211,29 +344,49 @@ def parse_ccd_residue(
     res_idx: int,
     is_spec: bool,
 ) -> Optional[ParsedResidue]:
-    """Parse an MMCIF ligand.
+    """Parse a CCD (Chemical Component Dictionary) residue into a ``ParsedResidue``.
 
-    First tries to get the SMILES string from the RCSB.
-    Then, tries to infer atom ordering using RDKit.
+    This function handles non-standard residues and ligands that are identified by
+    their CCD component code rather than a standard one-letter sequence token.  The
+    parsing proceeds as follows:
+
+    1. **Hydrogen removal** -- Strip all hydrogen atoms from the reference RDKit
+       molecule so that only heavy atoms remain.
+    2. **Single-atom shortcut** -- If the molecule has exactly one heavy atom
+       (e.g. a metal ion), build a minimal ``ParsedResidue`` immediately.
+    3. **Multi-atom path**:
+       a. Retrieve the ideal/computed 3-D conformer coordinates from the CCD entry.
+       b. Iterate over every heavy atom in the reference molecule and create a
+          ``ParsedAtom`` with its name, element, charge, conformer coordinates,
+          and chirality.  Experimental PDB coordinates are set to (0, 0, 0)
+          because this function is used during input parsing (no structure yet).
+       c. Extract all covalent bonds from the RDKit molecule, mapping original
+          atom indices to the new contiguous indices via ``idx_map``.
+    4. **Output** -- Return a ``ParsedResidue`` with token type set to the
+       ``UNK`` protein token, ``is_standard=False``, and ``atom_center`` /
+       ``atom_disto`` both set to 0 (placeholders, since CCD residues do not
+       have a canonical center/disto definition).
 
     Parameters
     ----------
-    name: str
-        The name of the molecule to parse.
-    ref_mol: Mol
-        The reference molecule to parse.
+    name : str
+        CCD component code (e.g. "ATP", "HEM") or "LIG" for SMILES-derived molecules.
+    ref_mol : Mol
+        RDKit molecule loaded from the CCD or constructed from SMILES.
     res_idx : int
-        The residue index.
+        The residue index to assign.
+    is_spec : bool
+        Whether this residue is in the design / special mask region.
 
     Returns
     -------
-    ParsedResidue, optional
-       The output ParsedResidue, if successful.
+    ParsedResidue or None
+        The parsed residue, or None if parsing fails.
 
     """
     unk_chirality = const.chirality_type_ids[const.unk_chirality_type]
 
-    # Remove hydrogens
+    # Remove hydrogens so that only heavy atoms are considered
     ref_mol = AllChem.RemoveHs(ref_mol, sanitize=False)
 
     # Check if this is a single atom CCD residue
@@ -351,41 +504,69 @@ def parse_polymer(
     components: dict[str, Mol],
     mask: np.ndarray,
 ) -> Optional[ParsedChain]:
-    """Process a sequence into a chain object.
+    """Parse a polymer sequence (protein / DNA / RNA) into a ``ParsedChain``.
 
-    Performs alignment of the full sequence to the polymer
-    residues. Loads coordinates and masks for the atoms in
-    the polymer, following the ordering in const.atom_order.
+    This function converts a token-level sequence into a chain of ``ParsedResidue``
+    objects by looking up each residue in the CCD components dictionary.  The
+    parsing pipeline for each residue position works as follows:
+
+    1. **Modified-residue correction** -- MSE (selenomethionine) is silently
+       remapped to MET so that it uses the standard methionine atom template.
+
+    2. **Standard vs. non-standard dispatch**:
+       - If the (corrected) residue name is in the standard token vocabulary
+         (``const.tokens``), it is treated as a *standard* residue.  Only the
+         canonical heavy atoms listed in ``const.ref_atoms[res_name]`` are kept,
+         in the canonical order.  No intra-residue bonds are stored.
+       - Otherwise the residue is delegated to ``parse_ccd_residue`` which
+         handles arbitrary CCD components (modified residues, ligands, etc.).
+
+    3. **Atom construction** (standard path):
+       a. Load the CCD reference molecule and strip hydrogens.
+       b. Retrieve the ideal/computed 3-D conformer.
+       c. For each canonical atom name, look up the RDKit atom by its ``name``
+          property, record its element, charge, conformer coordinates, and
+          chirality.  Experimental coordinates are set to (0, 0, 0).
+       d. Determine the center atom index (CA for protein, C1' for nucleotides)
+          and disto atom index (CB for protein -- CA for GLY, base atom for
+          nucleotides) from ``const.res_to_center_atom_id`` / ``res_to_disto_atom_id``.
+
+    4. **Output** -- Collect all residues into a ``ParsedChain``.
 
     Parameters
     ----------
     sequence : list[str]
-        The full sequence of the polymer.
+        Token-level sequence (e.g. ["ALA", "ARG", ...] for protein).
     entity : str
-        The entity id.
-    entity_type : str
-        The entity type.
+        Entity identifier shared by symmetric copies of this chain.
+    chain_type : str
+        Molecule type index (0 = PROTEIN, 1 = DNA, 2 = RNA).
     components : dict[str, Mol]
-        The preprocessed PDB components dictionary.
+        Pre-loaded CCD component dictionary mapping residue names to RDKit Mol
+        objects (typically loaded from ``ccd.pkl``).
+    mask : np.ndarray
+        Boolean array of length ``len(sequence)`` indicating which residue
+        positions are in the special / design mask region.
 
     Returns
     -------
-    ParsedChain, optional
-        The output chain, if successful.
+    ParsedChain or None
+        The parsed polymer chain, or None if parsing fails.
 
     Raises
     ------
     ValueError
-        If the alignment fails.
+        If a residue name cannot be resolved in the CCD dictionary.
 
     """
+    # Build the set of residue names that belong to the standard token vocabulary.
+    # Any name outside this set is treated as a non-standard (modified) residue.
     ref_res = set(const.tokens)
-    # ref_res is the set of all tokens
     unk_chirality = const.chirality_type_ids[const.unk_chirality_type]
     # for protein, unk_chirality is CHI_UNSPECIFIED
 
 
-    # Get coordinates and masks
+    # Iterate over every position in the sequence and build a ParsedResidue for each.
     parsed = []
     for res_idx, res_name in enumerate(sequence):
         # Check if modified residue
@@ -499,53 +680,98 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     schema: dict,
     ccd: Mapping[str, Mol],
 ) -> tuple[Target, str]:
-    """Parse a Boltz input yaml / json.
+    """Parse a Boltz input YAML / JSON schema into a ``Target`` and auxiliary info.
 
-    The input file should be a dictionary with the following format:
+    This is the top-level entry point for input parsing.  It orchestrates the full
+    pipeline that converts a user-authored schema dictionary into the internal
+    ``Target`` representation consumed by the model.  The pipeline has five major
+    stages:
 
-    version: 1
-    sequences:
-        - protein:
-            id: A
-            sequence: "MADQLTEEQIAEFKEAFSLF"
-            msa: path/to/msa1.a3m
-        - protein:
-            id: [B, C]
-            sequence: "AKLSILPWGHC"
-            msa: path/to/msa2.a3m
-        - rna:
-            id: D
-            sequence: "GCAUAGC"
-        - ligand:
-            id: E
-            smiles: "CC1=CC=CC=C1"
-        - ligand:
-            id: [F, G]
-            ccd: []
-    constraints:
-        - bond:
-            atom1: [A, 1, CA]
-            atom2: [A, 2, N]
-        - pocket:
-            binder: E
-            contacts: [[B, 1], [B, 2]]
+    **Stage 1 -- Entity grouping**
+        Items listed under ``sequences`` in the schema are grouped by
+        (entity_type, sequence) so that identical sequences that appear under
+        different chain IDs share the same entity.  This is important for
+        symmetric assemblies (e.g. homodimers).
+
+    **Stage 2 -- Per-entity parsing**
+        Each unique entity is parsed exactly once:
+        - *Polymers* (protein / DNA / RNA) are tokenized using the appropriate
+          letter-to-token map and then parsed by ``parse_polymer``.
+        - *CCD ligands* are parsed by ``parse_ccd_residue``.
+        - *SMILES ligands* are converted to an RDKit molecule, a 3-D conformer
+          is generated, and the result is parsed by ``parse_ccd_residue``.
+        The resulting ``ParsedChain`` is then assigned to every chain name that
+        maps to this entity (handling the ``id: [B, C]`` multi-copy syntax).
+
+    **Stage 3 -- Table construction**
+        All ``ParsedChain`` / ``ParsedResidue`` / ``ParsedAtom`` objects are
+        flattened into contiguous NumPy structured arrays (``Atom``, ``Bond``,
+        ``Residue``, ``Chain``).  Global indices (``atom_idx``, ``res_idx``,
+        ``asym_id``) are assigned during this traversal, and a mapping of
+        ``(chain_name, residue_idx, atom_name) -> global_atom_idx`` is built
+        for constraint resolution.
+
+    **Stage 4 -- Constraint resolution**
+        Bond constraints and pocket constraints from the schema are resolved
+        against the global atom/residue/chain index maps.
+
+    **Stage 5 -- Metadata assembly**
+        A ``Record`` is constructed with ``AntibodyInfo`` (including heavy/light
+        chain IDs extracted from the file name), per-chain ``ChainInfo``, and
+        ``InferenceOptions``.  The ground-truth sequence and spec mask for
+        antibody chains (H + L) are concatenated and returned as auxiliary info.
+
+    The input file should be a dictionary with the following format::
+
+        version: 1
+        sequences:
+            - protein:
+                id: A
+                sequence: "MADQLTEEQIAEFKEAFSLF"
+                msa: path/to/msa1.a3m
+            - protein:
+                id: [B, C]
+                sequence: "AKLSILPWGHC"
+                msa: path/to/msa2.a3m
+            - rna:
+                id: D
+                sequence: "GCAUAGC"
+            - ligand:
+                id: E
+                smiles: "CC1=CC=CC=C1"
+            - ligand:
+                id: [F, G]
+                ccd: []
+        constraints:
+            - bond:
+                atom1: [A, 1, CA]
+                atom2: [A, 2, N]
+            - pocket:
+                binder: E
+                contacts: [[B, 1], [B, 2]]
 
     Parameters
     ----------
     name : str
-        A name for the input.
+        A name for the input (typically the YAML file stem).  For antibody
+        design the convention is ``<pdb>_<H-chain>_<L-chain>_<suffix>``.
     schema : dict
-        The input schema.
-    components : dict
-        Dictionary of CCD components.
+        The parsed YAML / JSON input schema dictionary.
+    ccd : Mapping[str, Mol]
+        Pre-loaded CCD component dictionary mapping residue / component names
+        to RDKit Mol objects.
 
     Returns
     -------
-    Target
-        The parsed target.
+    tuple[Target, dict]
+        A two-element tuple containing:
+        - ``Target`` -- the fully parsed target (record + structure + sequences).
+        - ``dict``   -- auxiliary information with keys ``seq_gt`` (ground-truth
+          sequence string for antibody chains), ``spec_mask`` (design mask
+          string), and ``entity_to_gt`` (per-entity ground-truth mapping).
 
     """
-    # Assert version 1
+    # ---- Stage 1: Validate schema version ----
     version = schema.get("version", 1)
     if version != 1:
         msg = f"Invalid version {version} in input!"

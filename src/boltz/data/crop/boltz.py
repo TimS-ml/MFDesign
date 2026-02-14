@@ -1,3 +1,32 @@
+"""General-purpose Boltz cropping strategy for molecular structure prediction.
+
+This module implements the default spatial/contiguous cropping approach used by
+the Boltz model. The cropper selects a subset of tokens from a tokenized
+molecular structure, respecting maximum token and atom budgets.
+
+Cropping proceeds as follows:
+
+1. **Query selection**: A single token is chosen as the spatial center of the
+   crop. The query can be selected from a specific chain, a specific interface,
+   or (by default) from a randomly chosen interface or chain.
+
+2. **Distance-based ordering**: All resolved tokens are sorted by Euclidean
+   distance to the query token's center coordinates.
+
+3. **Greedy neighborhood expansion**: Tokens are added to the crop in order
+   of proximity. For each token, a contiguous neighborhood of residues from
+   the same chain is included. The neighborhood size is sampled uniformly at
+   initialization and controls the trade-off between spatial tightness
+   (small neighborhood) and chain contiguity (large neighborhood).
+
+4. **Budget enforcement**: Expansion stops when the maximum number of tokens
+   or atoms would be exceeded by the next addition.
+
+Interface-aware query selection uses pairwise distance computation (via
+``cdist``) to identify tokens near the boundary between two chains, biasing
+the crop toward interaction sites.
+"""
+
 from dataclasses import replace
 from typing import Optional
 
@@ -36,7 +65,10 @@ def pick_chain_token(
     chain_id: int,
     random: np.random.RandomState,
 ) -> np.ndarray:
-    """Pick a random token from a chain.
+    """Pick a random token from a specific chain.
+
+    If the chain has no tokens (e.g., it was filtered out), falls back to
+    picking a random token from all available tokens.
 
     Parameters
     ----------
@@ -70,31 +102,38 @@ def pick_interface_token(
     interface: np.ndarray,
     random: np.random.RandomState,
 ) -> np.ndarray:
-    """Pick a random token from an interface.
+    """Pick a random token from a chain-chain interface.
+
+    An interface token is one whose center coordinates are within a distance
+    cutoff of a token on the partner chain. This biases the crop toward
+    biologically relevant interaction sites.
+
+    The method handles edge cases where one or both chains may have no tokens
+    by falling back to the available chain or all tokens, respectively.
 
     Parameters
     ----------
     tokens : np.ndarray
         The token data.
-    interface : int
-        The interface ID.
+    interface : np.ndarray
+        The interface record containing chain_1 and chain_2 identifiers.
     random : np.ndarray
         The random state for reproducibility.
 
     Returns
     -------
     np.ndarray
-        The selected token.
+        The selected token from the interface region.
 
     """
-    # Sample random interface
+    # Extract the two chain IDs forming the interface
     chain_1 = int(interface["chain_1"])
     chain_2 = int(interface["chain_2"])
 
     tokens_1 = tokens[tokens["asym_id"] == chain_1]
     tokens_2 = tokens[tokens["asym_id"] == chain_2]
 
-    # If no interface, pick from the chains
+    # Handle cases where one or both chains have no resolved tokens
     if tokens_1.size and (not tokens_2.size):
         query = pick_random_token(tokens_1, random)
     elif tokens_2.size and (not tokens_1.size):
@@ -102,22 +141,30 @@ def pick_interface_token(
     elif (not tokens_1.size) and (not tokens_2.size):
         query = pick_random_token(tokens, random)
     else:
-        # If we have tokens, compute distances
+        # Both chains have tokens -- compute pairwise distances to find
+        # tokens near the interface boundary
         tokens_1_coords = tokens_1["center_coords"]
         tokens_2_coords = tokens_2["center_coords"]
 
+        # Compute all-vs-all pairwise distances between the two chains
         dists = cdist(tokens_1_coords, tokens_2_coords)
+
+        # Apply the interface distance cutoff to identify contacting tokens
         cuttoff = dists < const.interface_cutoff
 
-        # In rare cases, the interface cuttoff is slightly
-        # too small, then we slightly expand it if it happens
+        # In rare cases, the interface cutoff is slightly too small
+        # (e.g., for loosely packed interfaces). Expand by 5 Angstroms
+        # as a fallback to ensure we get at least some interface tokens.
         if not np.any(cuttoff):
             cuttoff = dists < (const.interface_cutoff + 5.0)
 
+        # Filter each chain to only tokens within the cutoff of the other chain.
+        # axis=1 checks if token_1[i] is close to ANY token in chain_2.
+        # axis=0 checks if token_2[j] is close to ANY token in chain_1.
         tokens_1 = tokens_1[np.any(cuttoff, axis=1)]
         tokens_2 = tokens_2[np.any(cuttoff, axis=0)]
 
-        # Select random token
+        # Combine interface tokens from both chains and pick one at random
         candidates = np.concatenate([tokens_1, tokens_2])
         query = pick_random_token(candidates, random)
 
@@ -125,7 +172,20 @@ def pick_interface_token(
 
 
 class BoltzCropper(Cropper):
-    """Interpolate between contiguous and spatial crops."""
+    """General Boltz cropper that interpolates between contiguous and spatial crops.
+
+    The neighborhood size parameter controls the cropping behavior:
+
+    - **Neighborhood = 0**: Pure spatial cropping. Each token is added
+      individually, producing a crop of the spatially closest tokens
+      regardless of chain contiguity.
+    - **Large neighborhood**: More contiguous cropping. When a token is added,
+      a window of neighboring residues (by residue index) from the same chain
+      is also included, producing longer contiguous chain segments.
+    - **Mixed range**: Sampling the neighborhood uniformly from a range (e.g.,
+      0 to 40) produces a mixture of spatial and contiguous crops across
+      different training examples.
+    """
 
     def __init__(self, min_neighborhood: int = 0, max_neighborhood: int = 40) -> None:
         """Initialize the cropper.
@@ -144,6 +204,7 @@ class BoltzCropper(Cropper):
             The maximum neighborhood size, by default 40.
 
         """
+        # Build a list of candidate neighborhood sizes (step of 2)
         sizes = list(range(min_neighborhood, max_neighborhood + 1, 2))
         self.neighborhood_sizes = sizes
 
@@ -181,12 +242,12 @@ class BoltzCropper(Cropper):
             The cropped data.
 
         """
-        # Check inputs
+        # Mutual exclusivity: only one targeting mode at a time
         if chain_id is not None and interface_id is not None:
             msg = "Only one of chain_id or interface_id can be provided."
             raise ValueError(msg)
 
-        # Randomly select a neighborhood size
+        # Sample a neighborhood size for this crop instance
         neighborhood_size = random.choice(self.neighborhood_sizes)
 
         # Get token data
@@ -196,16 +257,16 @@ class BoltzCropper(Cropper):
         chains = data.structure.chains
         interfaces = data.structure.interfaces
 
-        # Filter to valid chains
+        # Filter to valid (non-masked) chains
         valid_chains = chains[mask]
 
-        # Filter to valid interfaces
+        # Filter to valid interfaces (both endpoint chains must be valid)
         valid_interfaces = interfaces
         if valid_interfaces.size:
             valid_interfaces = valid_interfaces[mask[valid_interfaces["chain_1"]]]
             valid_interfaces = valid_interfaces[mask[valid_interfaces["chain_2"]]]
 
-        # Filter to resolved tokens
+        # Filter to resolved tokens (experimentally determined coordinates)
         valid_tokens = token_data[token_data["resolved_mask"]]
 
         # Check if we have any valid tokens
@@ -213,42 +274,56 @@ class BoltzCropper(Cropper):
             msg = "No valid tokens in structure"
             raise ValueError(msg)
 
-        # Pick a random token, chain, or interface
+        # ----------------------------------------------------------------
+        # Query token selection: determines the spatial center of the crop
+        # ----------------------------------------------------------------
+        # Priority: explicit chain_id > explicit interface_id > random interface > random chain
         if chain_id is not None:
+            # User specified a particular chain -- pick a random token from it
             query = pick_chain_token(valid_tokens, chain_id, random)
         elif interface_id is not None:
+            # User specified a particular interface -- pick from interface region
             interface = interfaces[interface_id]
             query = pick_interface_token(valid_tokens, interface, random)
         elif valid_interfaces.size:
+            # Default: randomly choose one of the valid interfaces, then
+            # pick a token from that interface region
             idx = random.randint(len(valid_interfaces))
             interface = valid_interfaces[idx]
             query = pick_interface_token(valid_tokens, interface, random)
         else:
+            # No interfaces available: randomly choose a chain, then pick
+            # a token from that chain
             idx = random.randint(len(valid_chains))
             chain_id = valid_chains[idx]["asym_id"]
             query = pick_chain_token(valid_tokens, chain_id, random)
 
-        # Sort all tokens by distance to query_coords
+        # ----------------------------------------------------------------
+        # Sort all resolved tokens by Euclidean distance to the query token
+        # ----------------------------------------------------------------
         dists = valid_tokens["center_coords"] - query["center_coords"]
-        indices = np.argsort(np.linalg.norm(dists, axis=1))   
+        indices = np.argsort(np.linalg.norm(dists, axis=1))
 
-        # Select cropped indices
+        # ----------------------------------------------------------------
+        # Greedy crop expansion: add tokens nearest-first with neighborhoods
+        # ----------------------------------------------------------------
         cropped: set[int] = set()
         total_atoms = 0
         for idx in indices:
-            # Get the token
+            # Get the current token
             token = valid_tokens[idx]
 
-            # Get all tokens from this chain
+            # Get all tokens from this chain (including unresolved ones)
             chain_tokens = token_data[token_data["asym_id"] == token["asym_id"]]
 
             # Pick the whole chain if possible, otherwise select
             # a contiguous subset centered at the query token
             if len(chain_tokens) <= neighborhood_size:
+                # Chain is small enough to include entirely
                 new_tokens = chain_tokens
             else:
                 # First limit to the maximum set of tokens, with the
-                # neighboorhood on both sides to handle edges. This
+                # neighborhood on both sides to handle edges. This
                 # is mostly for efficiency with the while loop below.
                 min_idx = token["res_idx"] - neighborhood_size
                 max_idx = token["res_idx"] + neighborhood_size
@@ -272,7 +347,7 @@ class BoltzCropper(Cropper):
                     new_tokens = new_tokens[new_tokens["res_idx"] >= min_idx]
                     new_tokens = new_tokens[new_tokens["res_idx"] <= max_idx]
 
-            # Compute new tokens and new atoms
+            # Compute new tokens and new atoms (exclude already-cropped)
             new_indices = set(new_tokens["token_idx"]) - cropped
             new_tokens = token_data[list(new_indices)]
             new_atoms = np.sum(new_tokens["atom_num"])
@@ -283,19 +358,19 @@ class BoltzCropper(Cropper):
             ):
                 break
 
-            # Add new indices
+            # Add new indices to the crop
             cropped.update(new_indices)
             total_atoms += new_atoms
 
-        # Get the cropped tokens sorted by index
+        # Sort cropped indices to maintain original token ordering
         token_data = token_data[sorted(cropped)]
         token_mask = token_mask[sorted(cropped)]
         token_region = token_region[sorted(cropped)]
 
-        # Only keep bonds within the cropped tokens
+        # Only keep bonds where both endpoints remain in the crop
         indices = token_data["token_idx"]
         token_bonds = token_bonds[np.isin(token_bonds["token_1"], indices)]
         token_bonds = token_bonds[np.isin(token_bonds["token_2"], indices)]
 
-        # Return the cropped tokens
+        # Return the cropped tokens with updated bond list
         return replace(data, tokens=token_data, bonds=token_bonds), token_mask, token_region
