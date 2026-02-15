@@ -1,3 +1,34 @@
+"""MFDesign prediction / inference script.
+
+This module implements the full inference pipeline for MFDesign, a diffusion-based
+model for antibody design built on top of Boltz-1. The pipeline proceeds as follows:
+
+1. **Input validation** – YAML or FASTA input files are checked, and any existing
+   predictions are optionally skipped or overridden.
+2. **MSA generation** – For each protein entity that lacks a precomputed MSA, a
+   multiple-sequence alignment is generated via the MMSeqs2 server.  Two rounds of
+   search are performed: a *paired* search (taxonomy-based pairing across chains)
+   and an *unpaired* search (per-chain homolog retrieval).  The results are merged
+   into a CSV file keyed by pairing index.
+3. **Input processing** – YAML files are parsed into internal ``Record`` / ``Target``
+   objects, CCD (Chemical Component Dictionary) is loaded, MSA CSV files are parsed
+   (with optional sequence-identity filtering), and everything is serialised to disk
+   as NumPy archives and a manifest JSON.
+4. **Model loading** – The Boltz-1 checkpoint (either pretrained or fine-tuned) is
+   loaded, with confidence-module parameters back-filled from the pretrained weights
+   when they are absent from a user-supplied checkpoint.
+5. **Prediction** – A PyTorch-Lightning ``Trainer`` drives the diffusion sampling
+   loop.  Structure coordinates are denoised over ``sampling_steps`` reverse-diffusion
+   steps, and (optionally) sequence tokens are predicted jointly.  Results are written
+   to PDB or mmCIF via ``BoltzWriter``.
+
+Usage::
+
+    python scripts/predict.py --data ./inputs --out_dir ./outputs --checkpoint ./model/stage_4.ckpt
+
+See ``run()`` at the bottom of this file for the full CLI interface.
+"""
+
 import pickle
 import sys
 sys.path.insert(0, './src')
@@ -26,8 +57,13 @@ from boltz.data.parse.yaml import parse_yaml
 from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.model import Boltz1
-import argparse 
+import argparse
 
+# ---------------------------------------------------------------------------
+# Remote URLs for the pretrained CCD dictionary and Boltz-1 model weights,
+# hosted on HuggingFace.  These are downloaded lazily to the local cache
+# directory the first time inference is run.
+# ---------------------------------------------------------------------------
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MODEL_URL = (
     "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt"
@@ -36,7 +72,22 @@ MODEL_URL = (
 
 @dataclass
 class BoltzProcessedInput:
-    """Processed input data."""
+    """Container for fully-processed inference inputs.
+
+    After the ``process_inputs`` pipeline has finished, this dataclass bundles
+    together the manifest (listing every target and its chain metadata), the
+    directory of serialised structure arrays, and the directory of processed
+    MSA arrays.  It is consumed directly by ``BoltzInferenceDataModule``.
+
+    Attributes
+    ----------
+    manifest : Manifest
+        The manifest object that catalogues all target records.
+    targets_dir : Path
+        Directory containing per-target ``.npz`` structure files.
+    msa_dir : Path
+        Directory containing per-entity ``.npz`` processed MSA files.
+    """
 
     manifest: Manifest
     targets_dir: Path
@@ -45,7 +96,65 @@ class BoltzProcessedInput:
 
 @dataclass
 class BoltzDiffusionParams:
-    """Diffusion process parameters."""
+    """Diffusion process hyper-parameters used by Boltz-1.
+
+    These follow the EDM (Elucidating the Design Space of Diffusion-Based
+    Generative Models) framework of Karras et al., adapted for protein
+    structure generation.  The noise schedule is parameterised in
+    continuous sigma-space and discretised into ``sampling_steps`` steps
+    during inference.
+
+    Attributes
+    ----------
+    gamma_0 : float
+        Churn parameter – fraction of noise injected at each reverse step
+        for stochastic sampling (Langevin-like correction).
+    gamma_min : float
+        Minimum churn multiplier, clipping the noise injection to avoid
+        instability at low sigma.
+    noise_scale : float
+        Global multiplier on the injected noise magnitude during reverse
+        diffusion.  Values > 1 increase stochasticity.
+    rho : float
+        Exponent controlling the spacing of the sigma schedule.  Higher
+        values concentrate more steps at low noise levels (fine detail).
+        Karras et al. recommend rho = 7; Boltz uses 8.
+    step_scale : float
+        Multiplier applied to each denoising update, effectively scaling
+        the step size.  Values > 1 take more aggressive steps.
+    temperature : float
+        Temperature for the noise distribution during reverse diffusion
+        (1.0 = standard; < 1 sharpens, > 1 broadens).
+    sigma_min : float
+        Smallest sigma in the noise schedule (near-clean end).
+    sigma_max : float
+        Largest sigma in the noise schedule (pure-noise end).
+    sigma_data : float
+        Data standard deviation assumed by the EDM preconditioning.
+        Determines how the network input/output are scaled.
+    P_mean : float
+        Mean of the log-normal distribution from which training sigmas
+        are drawn (log-space).
+    P_std : float
+        Standard deviation of the log-normal training sigma distribution.
+    coordinate_augmentation : bool
+        Whether to apply random rotation / translation augmentation to
+        coordinates during diffusion (training regularisation).
+    alignment_reverse_diff : bool
+        If True, align intermediate structures during reverse diffusion
+        to reduce rigid-body drift.
+    synchronize_sigmas : bool
+        If True, use the same sigma across all atoms at each step (as
+        opposed to per-atom noise schedules).
+    use_inference_model_cache : bool
+        If True, cache intermediate model representations across
+        recycling iterations for faster inference.
+    noise_type : str
+        Noise model for sequence tokens.  Options include
+        ``"discrete_absorb"`` (mask/absorbing state),
+        ``"discrete_uniform"`` (uniform corruption), and
+        ``"continuous"`` (Gaussian in embedding space).
+    """
 
     gamma_0: float = 0.605
     gamma_min: float = 1.107
@@ -63,10 +172,18 @@ class BoltzDiffusionParams:
     synchronize_sigmas: bool = True
     use_inference_model_cache: bool = True
     noise_type: str = "discrete_absorb"
-    
+
 @dataclass
 class AF3DiffusionParams:
-    """Diffusion process parameters."""
+    """AlphaFold-3-style diffusion process parameters.
+
+    Mirrors ``BoltzDiffusionParams`` but with default values closer to the
+    AlphaFold-3 noise schedule (gamma_0 = 0.8, rho = 7, step_scale = 1.0,
+    noise_scale = 1.0).  Can be swapped in via uncommenting the relevant
+    line in ``predict()`` for experimentation.
+
+    See ``BoltzDiffusionParams`` for full attribute documentation.
+    """
 
     gamma_0: float = 0.8
     gamma_min: float = 1.0
@@ -91,13 +208,19 @@ class AF3DiffusionParams:
 def download(cache: Path) -> None:
     """Download all the required data.
 
+    Downloads the CCD (Chemical Component Dictionary) pickle and the
+    pretrained Boltz-1 model checkpoint from HuggingFace, if they are
+    not already present in the local cache directory.  This function is
+    decorated with ``@rank_zero_only`` so that only the master process
+    performs the download in a distributed setting.
+
     Parameters
     ----------
     cache : Path
         The cache directory.
 
     """
-    # Download CCD
+    # Download CCD dictionary (maps 3-letter residue codes to atom metadata)
     ccd = cache / "ccd.pkl"
     if not ccd.exists():
         click.echo(
@@ -106,7 +229,7 @@ def download(cache: Path) -> None:
         )
         urllib.request.urlretrieve(CCD_URL, str(ccd))  # noqa: S310
 
-    # Download model
+    # Download pretrained Boltz-1 model weights (with confidence head)
     model = cache / "boltz1_conf.ckpt"
     if not model.exists():
         click.echo(
@@ -174,11 +297,11 @@ def check_inputs(
     existing = {e.name for e in existing if e.is_dir()} # existing is a set of the names of directories in the predictions directory
 
     # Remove them from the input data
-    if existing and not override: 
+    if existing and not override:
     # if there are existing predictions and the override flag is not set to True, we will skip the input data that has already been predicted
-        data = [d for d in data if d.stem not in existing] 
+        data = [d for d in data if d.stem not in existing]
         # remove the existing predictions from the input data
-        num_skipped = len(existing) - len(data) 
+        num_skipped = len(existing) - len(data)
         # num_skipped is the number of existing predictions that will be skipped
         msg = (
             f"Found some existing predictions ({num_skipped}), "
@@ -187,7 +310,7 @@ def check_inputs(
             "predictions, please set the --override flag."
         )
         click.echo(msg)
-    elif existing and override: 
+    elif existing and override:
         # override is set to True, we will override the existing predictions
         msg = "Found existing predictions, will override."
         click.echo(msg)
@@ -204,10 +327,29 @@ def compute_msa(
 ) -> None:
     """Compute the MSA for the input data.
 
+    This function generates a multiple-sequence alignment for one target
+    using the ColabFold / MMSeqs2 server.  Two searches are performed:
+
+    1. **Paired MSA** – all protein chains in the target are submitted
+       together with ``use_pairing=True``.  The server performs a
+       taxonomy-based pairing so that homologs from the same organism
+       are aligned across chains.  This captures inter-chain
+       co-evolutionary signal essential for complex modelling.
+    2. **Unpaired MSA** – each chain is searched independently
+       (``use_pairing=False``) to maximise per-chain sequence depth.
+
+    The paired and unpaired hits are then merged per entity.  The merged
+    alignment is written as a two-column CSV (``key,sequence``) where:
+    - ``key >= 0`` denotes the pairing index for paired rows (rows with
+      the same key across different entity CSV files originate from the
+      same organism and should be aligned together during featurisation).
+    - ``key == -1`` denotes unpaired rows.
+
     Parameters
     ----------
     data : dict[str, str]
-        The input protein sequences.
+        The input protein sequences.  Keys are entity identifiers
+        (``"{target_id}_{entity_id}"``), values are amino-acid strings.
     target_id : str
         The target id.
     msa_dir : Path
@@ -218,9 +360,15 @@ def compute_msa(
         The MSA pairing strategy.
 
     """
-    
-    # in our ab design, len(data) is always greater than 1 (antibody + antigen)
-    # First, we need to obtain the paired MSA
+
+    # -----------------------------------------------------------------------
+    # Step 1: Paired MSA generation.
+    # In antibody design, len(data) is always > 1 (antibody chain(s) + antigen).
+    # Paired MSA captures co-evolutionary coupling *between* chains by finding
+    # homologous pairs from the same species.  The server returns one A3M
+    # string per input chain; sequences with no cross-chain partner are
+    # represented as gap-only ("DUMMY") rows.
+    # -----------------------------------------------------------------------
     if len(data) > 1:
         paired_msas = run_mmseqs2(
             list(data.values()),
@@ -238,13 +386,19 @@ def compute_msa(
             ">103\nseq1\n>UniRef100_9234K2\nseq2\n>UniRef100_22FSF2\nseq3\n",
             ...
         ]
-        
+
         seq may be "DUMMY"
         """
     else:
+        # Single-chain target: no cross-chain pairing is possible.
         paired_msas = [""] * len(data)
 
-
+    # -----------------------------------------------------------------------
+    # Step 2: Unpaired MSA generation.
+    # Each chain is searched independently against UniRef and environmental
+    # databases.  This maximises per-chain sequence depth regardless of
+    # whether a cross-chain partner exists.
+    # -----------------------------------------------------------------------
     unpaired_msa = run_mmseqs2(
         list(data.values()),
         msa_dir / f"{target_id}_unpaired_tmp",
@@ -254,44 +408,51 @@ def compute_msa(
         pairing_strategy=msa_pairing_strategy,
     )
 
+    # -----------------------------------------------------------------------
+    # Step 3: Merge paired and unpaired MSAs per entity, then write CSV.
+    # -----------------------------------------------------------------------
     for idx, name in enumerate(data):
-        # Get paired sequences
+        # --- Extract paired sequences (strip headers, keep every 2nd line) ---
         paired = paired_msas[idx].strip().splitlines()
         paired = paired[1::2]  # ignore headers
         # paired = paired[: const.max_paired_seqs]
         """
         const.max_msa_seqs = 16384 (paired + unpaired)
         const.max_paired_seqs = 8192 (paired)
-        """        
-        
+        """
+
 
         # Set key per row and remove empty sequences
+        # A row is "empty" when it consists entirely of gaps (the chain had no
+        # homolog in the paired organism).  The key is the original row index
+        # and serves as the pairing identifier across entities.
         keys = [idx for idx, s in enumerate(paired) if s != "-" * len(s)]
         # keys is a list of indices of the paired sequences that are not empty (DUMMY sequences are not included)
         paired = [s for s in paired if s != "-" * len(s)]
         # paired is a list of the paired sequences that are not empty (DUMMY sequences are not included)
 
-        # Combine paired-unpaired sequences
+        # --- Extract unpaired sequences (strip headers, keep every 2nd line) ---
         unpaired = unpaired_msa[idx].strip().splitlines()
         unpaired = unpaired[1::2]
         # unpaired = unpaired[: (const.max_msa_seqs - len(paired))]
         # unpaired is a list of the unpaired sequences
         if paired:
             unpaired = unpaired[1:]  # ignore query is already present
-            # unpaired[1:] is the sequence itself that we are interested in
+            # The query sequence appears as the first row in both paired and
+            # unpaired results; drop the duplicate from unpaired.
 
-        # Combine
+        # --- Combine paired (keyed) and unpaired (key = -1) rows ---
         seqs = paired + unpaired
         keys = keys + [-1] * len(unpaired)
         # keys = -1 means the sequence is the results of unpaired msa
 
-        # Dump MSA
+        # --- Write CSV with columns: key, sequence ---
         csv_str = ["key,sequence"] + [f"{key},{seq}" for key, seq in zip(keys, seqs)]
 
         msa_path = msa_dir / f"{name}.csv"
         # the format of name is like this: target_id_entity_id
         # where target_id is the file name of the yaml file in our case
-        
+
         with msa_path.open("w") as f:
             f.write("\n".join(csv_str))
 
@@ -314,6 +475,22 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
 ) -> dict:
     """Process the input data and output directory.
 
+    This is the main input-processing pipeline.  For every input file it:
+
+    1. Parses the YAML (or FASTA) into a ``Target`` object containing a
+       ``Record`` (chain metadata) and a ``Structure`` (atom coordinates,
+       residue types, etc.).
+    2. For each protein entity that does not already have a precomputed MSA,
+       decides whether to generate one via the MMSeqs2 server.  The ground-
+       truth sequence is preferred for MSA retrieval because it provides
+       stronger co-evolutionary signal than a designed / masked sequence.
+    3. Parses the per-entity MSA CSV files.  When
+       ``msa_filtering_threshold`` is set, ``parse_csv_for_ab_design`` is
+       used to filter homologs by sequence identity so that very similar
+       sequences (which leak information during training) are removed.
+    4. Serialises the processed MSA, structure, and manifest to disk in
+       NumPy ``.npz`` and JSON formats for consumption by the data loader.
+
     Parameters
     ----------
     data : list[Path]
@@ -322,10 +499,28 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
         The output directory.
     ccd_path : Path
         The path to the CCD dictionary.
+    msa_dir : Path
+        Directory for raw MSA CSV files (per-entity).
+    preprocessed_data_path : str
+        Path to the JSON file with preprocessed metadata (e.g., summary.json).
+    msa_filtering_threshold : float
+        Sequence identity threshold for MSA filtering.  Homologs with
+        identity above this value to the query are removed.
     max_msa_seqs : int, optional
         Max number of MSA sequences, by default 4096.
+    processed_msa_dir : Path, optional
+        Directory for serialised ``.npz`` MSA arrays.
     use_msa_server : bool, optional
         Whether to use the MMSeqs2 server for MSA generation, by default False.
+    msa_server_url : str, optional
+        URL of the MMSeqs2 server.
+    msa_pairing_strategy : str, optional
+        Strategy for cross-chain MSA pairing (e.g., ``"greedy"``).
+    only_process_msa : bool, optional
+        If True, only generate / process MSAs and exit early without
+        writing structures or the manifest.
+    generate_msa : bool, optional
+        If True, generate MSAs from scratch (requires ``use_msa_server``).
 
     Returns
     -------
@@ -345,19 +540,23 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
     processed_msa_dir.mkdir(parents=True, exist_ok=True)
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load CCD
+    # Load the CCD (Chemical Component Dictionary) which maps residue /
+    # ligand names to their atom-level definitions.
     with ccd_path.open("rb") as file:
         ccd = pickle.load(file)  # noqa: S301
-        
-    # load preprocessed data
+
+    # Load preprocessed metadata (e.g., per-target chain info, ground truth
+    # sequences, epitope annotations) used during MSA filtering.
     with open(preprocessed_data_path, "r") as file:
         preprocessed_data = json.load(file)
 
-    # Parse input data
+    # -----------------------------------------------------------------------
+    # Main loop: iterate over every input file and process it.
+    # -----------------------------------------------------------------------
     records: list[Record] = []
     chain_infos = {}
     for path in tqdm(data):
-        # Parse data
+        # ------ Step 1: Parse the input file into a Target object ------
         if path.suffix in (".fa", ".fas", ".fasta"):
             target = parse_fasta(path, ccd)
         elif path.suffix in (".yml", ".yaml"):
@@ -377,11 +576,13 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
         target_id = target.record.id
         # target_id the file name of the yaml file in our case
 
-        # Get all MSA ids and decide whether to generate MSA
+        # ------ Step 2: Determine which entities need MSA generation ------
+        # Walk through all chains; for protein chains without an existing MSA
+        # path (msa_id == 0), add them to the generation queue.
         to_generate = {}
         prot_id = const.chain_type_ids["PROTEIN"]
         # prot_id is the id of the protein chain type, i.e. 0, in our ab design, chains are always protein chains, prot_id is always 0
-        
+
         for chain in target.record.chains:
             # Add to generate list, assigning entity id
             if (chain.mol_type == prot_id) and (chain.msa_id == 0):
@@ -389,7 +590,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 # else, msa_id is the precomputed msa file path
                 entity_id = chain.entity_id
                 # obtain the entity id of the chain. Note that may be several chains with the same entity id if their sequences are the same
-                
+
                 msa_id = f"{target_id}_{entity_id}"
                 # target_id is the file name of the yaml file in our case
                 # entity_id is the entity id of the chain
@@ -403,6 +604,7 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 # this branch means the chain is not a protein chain, we will not encounter this branch in our ab design
                 chain.msa_id = -1
 
+        # ------ Step 3: Generate MSAs if needed ------
         # to_generate is not empty means we have not generated the msa for some chains; we need to check set the use_msa_server flag to True
         # Generate MSA
         if to_generate and not use_msa_server and generate_msa:
@@ -421,10 +623,11 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 msa_pairing_strategy=msa_pairing_strategy,
             )
 
-        # Parse MSA data
+        # ------ Step 4: Parse and process raw MSA CSVs into .npz arrays ------
+        # Collect distinct MSA paths across all chains (sorted for determinism).
         msas = sorted({c.msa_id for c in target.record.chains if c.msa_id != -1})
         # msas is a list of the msa paths and sorted by the entity id
-                
+
         msa_id_map = {}
         for msa_idx, msa_id in enumerate(msas):
             # Check that raw MSA exists
@@ -439,12 +642,17 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                 raise FileNotFoundError(msg)
             # check if the processed msa file exists, if not, we need to parse the msa file
             if not processed.exists():
-                # in our ab design, the msa file is always a csv file
+                # Parse the raw CSV MSA into an internal MSA object.
+                # In antibody design, the MSA file is always a CSV file.
                 if msa_path.suffix == ".csv":
                     if msa_filtering_threshold is not None:
+                        # parse_csv_for_ab_design applies sequence-identity
+                        # filtering: homologs with identity above the threshold
+                        # to the query are removed to prevent data leakage and
+                        # to ensure diversity in the alignment.
                         msa: MSA = parse_csv_for_ab_design(
-                            msa_path, max_seqs=max_msa_seqs, 
-                            entry_info=preprocessed_data[target_id], 
+                            msa_path, max_seqs=max_msa_seqs,
+                            entry_info=preprocessed_data[target_id],
                             msa_filtering_threshold=msa_filtering_threshold
                         )[0]
                     else:
@@ -453,11 +661,16 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
                     msg = f"MSA file {msa_path} not supported, only csv."
                     raise RuntimeError(msg)
 
+                # Serialise the processed MSA to a compressed NumPy archive
+                # for fast loading during inference.
                 msa.dump(processed)
 
         if only_process_msa:
             continue
 
+        # ------ Step 5: Remap chain MSA IDs and save structure ------
+        # Replace the file-path-based msa_id with the index-based identifier
+        # that the data loader expects (e.g., "target_0", "target_1").
         for c in target.record.chains:
             if (c.msa_id != -1) and (c.msa_id in msa_id_map):
                 c.msa_id = msa_id_map[c.msa_id]
@@ -465,43 +678,73 @@ def process_inputs(  # noqa: C901, PLR0912, PLR0915
         # Keep record
         records.append(target.record)
 
-        # Dump structure
+        # Dump structure (atom coordinates, residue metadata) as .npz
         struct_path = structure_dir / f"{target.record.id}.npz"
         target.structure.dump(struct_path)
 
     if only_process_msa:
         return
 
-    # Dump manifest
+    # ------ Step 6: Write the manifest and chain info to disk ------
+    # The manifest is a JSON file listing every target record; it is the
+    # primary index used by BoltzInferenceDataModule to enumerate samples.
     manifest = Manifest(records)
     manifest.dump(out_dir / "processed" / "manifest.json")
 
+    # Chain info contains per-target metadata such as entity-to-ground-truth
+    # mappings, design region masks, etc.
     if len(chain_infos) > 0:
         with open(out_dir / "processed" / "chain_infos.json", "w") as f:
             json.dump(chain_infos, f)
 
-def check_checkpoint(pretrained: Path, checkpoint: Path) -> None: 
+def check_checkpoint(pretrained: Path, checkpoint: Path) -> None:
+    """Ensure a user-supplied checkpoint is compatible with the pretrained model.
+
+    Fine-tuned checkpoints may lack the confidence-module parameters (and
+    the ``out_token_feat_update`` layer in the structure module) that are
+    present in the pretrained Boltz-1 weights.  This function back-fills
+    any missing parameters from the pretrained checkpoint so that the
+    confidence head can be used at inference time.
+
+    It also strips extraneous keys from the sequence model hyper-parameters
+    that are not expected by the current model definition (keeping only
+    ``hidden_dim``, ``vocab_size``, and ``dropout``).
+
+    If any modifications are made, the corrected checkpoint is saved back
+    to the same path.
+
+    Parameters
+    ----------
+    pretrained : Path
+        Path to the official pretrained Boltz-1 checkpoint.
+    checkpoint : Path
+        Path to the user-supplied (fine-tuned) checkpoint.
+    """
 
     pretrained_dict = torch.load(pretrained, map_location="cpu")
     checkpoint_dict = torch.load(checkpoint, map_location="cpu")
 
     is_change = False
-    # Remove the unused parameters
+    # Remove the unused parameters from the sequence model hyperparameters.
+    # Only keep the essential keys: hidden_dim, vocab_size, dropout.
     for k, v in checkpoint_dict["hyper_parameters"]["score_model_args"]["sequence_model_args"].items():
         if k not in {"hidden_dim", "vocab_size", "dropout"}:
             is_change = True
             del checkpoint_dict["hyper_parameters"]["score_model_args"]["sequence_model_args"][k]
-    
+
     # If use self trained checkpoint, it is necessary to manually add confidence_module for inference.
+    # Copy confidence_module and out_token_feat_update weights from the
+    # pretrained model into the fine-tuned checkpoint so that confidence
+    # scores (pTM, ipTM, pLDDT, PAE, PDE) can be predicted at inference.
     module_params = {
-        k: v for k, v in pretrained_dict["state_dict"].items() 
+        k: v for k, v in pretrained_dict["state_dict"].items()
         if k.startswith('confidence_module') or k.startswith('structure_module.out_token_feat_update')
     }
     for k,v in module_params.items():
         if k not in checkpoint_dict["state_dict"]:
             is_change = True
             checkpoint_dict["state_dict"][k] = v
-    
+
     if is_change:
         click.echo("The checkpoint has been changed, we will save it.")
         torch.save(checkpoint_dict, checkpoint)
@@ -539,7 +782,28 @@ def predict(
     sequence_prediction: bool = True,
     use_epitope: bool = True
 ) -> None:
-    """Run predictions with Boltz-1."""
+    """Run predictions with Boltz-1.
+
+    This is the top-level prediction function that orchestrates the full
+    inference pipeline:
+
+    1. **Environment setup** – Disable gradients, set matmul precision,
+       optionally seed the RNG, and create output directories.
+    2. **Download** – Fetch pretrained CCD and model weights if missing.
+    3. **Input validation** – Expand input directory, skip already-predicted
+       targets unless ``override`` is set.
+    4. **Input processing** – Parse YAML/FASTA, generate or load MSAs,
+       filter MSAs, serialise structures and manifest to disk.
+    5. **Data module creation** – Wrap processed inputs in a
+       ``BoltzInferenceDataModule`` for batched loading.
+    6. **Model loading** – Load Boltz-1 from a checkpoint (pretrained or
+       fine-tuned).  If fine-tuned, back-fill confidence-module weights.
+    7. **Diffusion sampling** – Run reverse diffusion for ``sampling_steps``
+       steps with ``recycling_steps`` recycling iterations, generating
+       ``diffusion_samples`` independent samples per target.
+    8. **Output writing** – ``BoltzWriter`` writes PDB/mmCIF files and
+       confidence metrics (pTM, ipTM, pLDDT, PAE, PDE) for each sample.
+    """
     # If cpu, write a friendly warning
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
@@ -552,12 +816,16 @@ def predict(
     if ground_truth_structure_dir is not None:
         ground_truth_structure_dir = Path(ground_truth_structure_dir).expanduser()
 
+    # ---------------------------------------------------------------------------
+    # Stage 1: Environment setup
+    # ---------------------------------------------------------------------------
+
     # Set no grad
-    torch.set_grad_enabled(False) 
+    torch.set_grad_enabled(False)
     # disable gradient computation for inference
 
     # Ignore matmul precision warning
-    torch.set_float32_matmul_precision("highest") 
+    torch.set_float32_matmul_precision("highest")
     # set the precision of the matmul operation to highest
 
     # Set seed if desired
@@ -565,23 +833,26 @@ def predict(
         seed_everything(seed)
 
     # Set cache path
-    cache = Path(cache).expanduser() 
+    cache = Path(cache).expanduser()
     # expand the cache path like ~/.boltz to the absolute path like /home/yangnianzu/.boltz
-    cache.mkdir(parents=True, exist_ok=True) 
+    cache.mkdir(parents=True, exist_ok=True)
     # create the cache directory if it does not exist and all parent directories will be created too
 
     # Create output directories
     data = Path(data).expanduser()
     out_dir = Path(out_dir).expanduser()
-    out_dir = out_dir / f"boltz_results_{data.stem}" 
+    out_dir = out_dir / f"boltz_results_{data.stem}"
     # data.stem is the name of the input data without the extension and without the father directory
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine whether MSAs need to be generated from scratch.
+    # If neither raw nor processed MSA directories are provided,
+    # MSA generation via the MMSeqs2 server will be triggered later.
     is_generate = False
     if msa_dir is None and processed_msa_dir is None:
         is_generate = True
         click.echo("No MSA directory provided.")
-    
+
     if msa_dir is None:
         msa_dir = out_dir / "msa"
     else:
@@ -592,19 +863,23 @@ def predict(
     else:
         processed_msa_dir = out_dir / "processed" / "msa"
 
-    # Download necessary data and model
-    download(cache) 
+    # ---------------------------------------------------------------------------
+    # Stage 2: Download pretrained CCD and model weights (if not cached)
+    # ---------------------------------------------------------------------------
+    download(cache)
     # if the local cache is not found, download the data and model from the remote server
 
-    # Validate inputs
-    data = check_inputs(data, out_dir, override) 
+    # ---------------------------------------------------------------------------
+    # Stage 3: Validate inputs (expand directory, skip existing predictions)
+    # ---------------------------------------------------------------------------
+    data = check_inputs(data, out_dir, override)
     # return the data files in the input data directory (may skip some files if we have already predicted them, depends on the override flag)
-    if not data: 
+    if not data:
         # if the input data is empty, we will exit
         click.echo("No predictions to run, exiting.")
         return
 
-    # Set up trainer
+    # Set up distributed training strategy if multiple devices are requested.
     strategy = "auto"
     if (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
@@ -621,7 +896,9 @@ def predict(
     msg += "s" if len(data) > 1 else ""
     click.echo(msg)
 
-    # Process inputs
+    # ---------------------------------------------------------------------------
+    # Stage 4: Process inputs (parse YAML, generate/load MSAs, serialise)
+    # ---------------------------------------------------------------------------
     ccd_path = cache / "ccd.pkl"
     process_inputs(
         data=data,
@@ -642,7 +919,9 @@ def predict(
         click.echo("We have only precomputed the MSA for the input data and exit.")
         return
 
-    # Load processed data
+    # ---------------------------------------------------------------------------
+    # Stage 5: Create inference data module from processed inputs
+    # ---------------------------------------------------------------------------
     processed_dir = out_dir / "processed"
     processed = BoltzProcessedInput(
         manifest=Manifest.load(processed_dir / "manifest.json"),
@@ -650,7 +929,8 @@ def predict(
         msa_dir=processed_msa_dir,
     )
 
-    # Create data module
+    # BoltzInferenceDataModule wraps the processed data into a PyTorch
+    # DataLoader that yields featurised batches for the model.
     data_module = BoltzInferenceDataModule(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
@@ -661,6 +941,9 @@ def predict(
         use_epitope=use_epitope
     )
 
+    # ---------------------------------------------------------------------------
+    # Stage 6: Load the Boltz-1 model from checkpoint
+    # ---------------------------------------------------------------------------
     pretrained = cache / "boltz1_conf.ckpt"
     # Load model
     if checkpoint is None:
@@ -668,6 +951,12 @@ def predict(
     else:
         checkpoint = Path(checkpoint).expanduser()
 
+    # Prediction arguments control the sampling loop:
+    # - recycling_steps: number of iterative refinement cycles through the
+    #   trunk (analogous to AlphaFold recycling).
+    # - sampling_steps: number of reverse-diffusion denoising steps.
+    # - diffusion_samples: number of independent structure samples to draw
+    #   per target (each starts from independent noise).
     predict_args = {
         "recycling_steps": recycling_steps,
         "sampling_steps": sampling_steps,
@@ -676,15 +965,29 @@ def predict(
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
     }
-    # diffusion_params = AF3DiffusionParams()
+
+    # Instantiate diffusion parameters (EDM / Karras schedule).
+    # diffusion_params = AF3DiffusionParams()  # Alternative AF3-style schedule
     diffusion_params = BoltzDiffusionParams()
     diffusion_params.step_scale = step_scale
     diffusion_params.temperature = temperature
     diffusion_params.noise_type = noise_type
 
+    # If using a fine-tuned checkpoint, back-fill confidence module weights
+    # from the pretrained model so that confidence prediction works.
     if checkpoint != pretrained:
         check_checkpoint(pretrained, checkpoint)
 
+    # Load the model from checkpoint.  Key flags:
+    # - strict=False: allow missing keys (e.g., EMA buffers).
+    # - structure_prediction_training=False: inference mode for structure.
+    # - sequence_prediction_training: whether to also predict sequences.
+    # - confidence_prediction=True: enable pTM/ipTM/pLDDT/PAE/PDE heads.
+    # - confidence_imitate_trunk=True: confidence module reuses trunk
+    #   representations rather than running a separate forward pass.
+    # - alpha_pae=1.0: weight for PAE loss in training (unused at inference
+    #   but required by the constructor).
+    # - ema=False: do not use EMA weights at inference.
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=False,
@@ -702,7 +1005,13 @@ def predict(
     click.echo(f"Loaded model from checkpoint {checkpoint}")
     model_module.eval()
 
-    # Create prediction writer
+    # ---------------------------------------------------------------------------
+    # Stage 7: Run prediction via PyTorch Lightning Trainer
+    # ---------------------------------------------------------------------------
+
+    # BoltzWriter is a prediction callback that converts raw model outputs
+    # (atom coordinates, confidence logits) into PDB/mmCIF files and
+    # confidence metric summaries on disk.
     pred_writer = BoltzWriter(
         data_dir=processed.targets_dir,
         output_dir=out_dir / "predictions",
@@ -719,7 +1028,9 @@ def predict(
         precision=32,
     )
 
-    # Compute predictions
+    # Launch the prediction loop.  The Trainer iterates over the data module,
+    # calls model_module.predict_step() for each batch (which runs reverse
+    # diffusion), and feeds the outputs to BoltzWriter via the callback hook.
     trainer.predict(
         model_module,
         datamodule=data_module,
@@ -727,6 +1038,13 @@ def predict(
     )
 
 def run():
+    """CLI entry point: parse arguments and launch the prediction pipeline.
+
+    This function defines the full set of command-line arguments for
+    ``scripts/predict.py`` and delegates to ``predict()`` with the parsed
+    values.  It is invoked directly when the script is run as
+    ``python scripts/predict.py ...``.
+    """
     parser = argparse.ArgumentParser(description="Run Boltz predictions directly.")
     parser.add_argument("--data", type=str, required=True, help="Path to input data.")
     parser.add_argument(
@@ -793,14 +1111,14 @@ def run():
         default="greedy",
         help="MSA pairing strategy.",
     )
-    
+
     # only precompute the MSA for the input data
     parser.add_argument(
         "--only_process_msa",
         action="store_true",
         help="Only precompute the MSA for the input data.",
     )
-    
+
     # threshold for the MSA filtering
     parser.add_argument(
         "--msa_filtering_threshold",
@@ -815,7 +1133,7 @@ def run():
         default="./data/summary.json",
         help="Path to preprocessed data.",
     )
-    
+
     parser.add_argument(
         "--msa_dir",
         type=str,
@@ -850,13 +1168,13 @@ def run():
         default="discrete_absorb",
         help="Noise type.",
     )
-    
+
     parser.add_argument(
         "--only_structure_prediction",
         action="store_false",
         help="Only predict structure, no sequence prediction result and no sequence model used",
     )
-    
+
     parser.add_argument(
         "--no_epitope",
         action="store_false",

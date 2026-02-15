@@ -1,3 +1,45 @@
+"""Trunk architecture for the Boltz protein structure prediction model.
+
+This module implements the core "trunk" of the model, responsible for
+building rich token-level and pairwise representations from raw input
+features. The data flow through the trunk proceeds as follows:
+
+1. **InputEmbedder** -- Converts raw per-token features (residue type,
+   MSA profile, deletion statistics, pocket features) into an initial
+   single (token-level) embedding.  Optionally runs an atom-level
+   attention encoder (AtomAttentionEncoder) to capture fine-grained
+   atom-level information and aggregate it up to the token level before
+   concatenation with the other features.
+
+2. **MSAModule** -- Takes the initial pairwise representation *z* and
+   the input embedding and iteratively refines *z* using information
+   from the Multiple Sequence Alignment (MSA).  Each MSALayer contains
+   two communication pathways:
+     * MSA stack: pair-weighted averaging lets MSA rows attend to each
+       other with pairwise bias, followed by a transition block.
+     * Pairwise stack: an outer-product mean transfers coevolutionary
+       signal from the MSA into *z*, followed by triangular
+       multiplicative updates, triangular attention (starting and ending
+       node variants), and a transition block.
+
+3. **PairformerModule** -- Further refines the pairwise representation
+   *z* (and optionally the single representation *s*) through a stack of
+   PairformerLayers.  Each layer applies:
+     * Triangle multiplication (outgoing then incoming) to propagate
+       information along edges of the residue-pair graph.
+     * Triangle attention (starting-node and ending-node) for long-range
+       pairwise communication.
+     * A pairwise transition feed-forward block.
+     * Attention with pair bias on the single representation *s*, using
+       *z* to modulate attention logits, followed by a single-rep
+       transition.
+
+4. **DistogramModule** -- A lightweight prediction head that symmetrises
+   the pairwise representation and projects it to distance-distribution
+   bins, yielding an inter-residue distogram used as an auxiliary
+   training objective.
+"""
+
 from typing import Dict, Tuple
 
 from fairscale.nn.checkpoint.checkpoint_activations import checkpoint_wrapper
@@ -22,7 +64,16 @@ from boltz.model.modules.encoders import AtomAttentionEncoder
 
 
 class InputEmbedder(nn.Module):
-    """Input embedder."""
+    """Input embedder.
+
+    Converts raw per-token features into a single (token-level) embedding
+    vector.  When the atom encoder is enabled, atom-level features are first
+    processed through an AtomAttentionEncoder which performs windowed
+    self-attention over atoms and then aggregates the result back to the
+    token level.  The atom-level summary is concatenated with residue type
+    one-hot, MSA profile, deletion mean, and pocket features to form the
+    final input embedding.
+    """
 
     def __init__(
         self,
@@ -96,25 +147,46 @@ class InputEmbedder(nn.Module):
 
         """
         # Load relevant features
-        res_type = feats["res_type"]
-        profile = feats["profile"]
-        deletion_mean = feats["deletion_mean"].unsqueeze(-1)
-        pocket_feature = feats["pocket_feature"]
+        res_type = feats["res_type"]          # One-hot residue type  (B, N_tok, num_tokens)
+        profile = feats["profile"]            # MSA column profile    (B, N_tok, num_tokens)
+        deletion_mean = feats["deletion_mean"].unsqueeze(-1)  # Mean deletion count (B, N_tok, 1)
+        pocket_feature = feats["pocket_feature"]              # Pocket info         (B, N_tok, D_pocket)
 
-        # Compute input embedding
+        # Compute input embedding: obtain atom-level summary or use zeros
         if self.no_atom_encoder:
+            # Skip atom encoder; use a zero placeholder of shape (B, N_tok, token_s)
             a = torch.zeros(
                 (res_type.shape[0], res_type.shape[1], self.token_s),
                 device=res_type.device,
             )
         else:
+            # Run atom attention encoder: processes atom-level features with
+            # windowed self-attention and aggregates back to token level.
+            # Only the token-level summary `a` is used here; the remaining
+            # outputs (q, c, p, to_keys) are discarded at this stage.
             a, _, _, _, _ = self.atom_attention_encoder(feats)
+
+        # Concatenate all token-level features along the feature dimension
+        # to form the raw input embedding s of shape (B, N_tok, s_input_dim).
         s = torch.cat([a, res_type, profile, deletion_mean, pocket_feature], dim=-1)
         return s
 
 
 class MSAModule(nn.Module):
-    """MSA module."""
+    """MSA module.
+
+    Processes Multiple Sequence Alignment (MSA) data together with an
+    evolving pairwise representation.  The module first projects MSA rows
+    (one-hot amino acid types, deletion indicators, and optionally a
+    pairing flag) into an internal MSA embedding space and adds the
+    projected input embedding.  It then runs a configurable number of
+    MSALayers, each of which updates the MSA representation via
+    pair-weighted averaging (using the pairwise matrix as bias) and
+    feeds coevolutionary signal back into the pairwise representation
+    through outer-product mean and triangle operations.
+
+    The final output is the refined pairwise representation *z*.
+    """
 
     def __init__(
         self,
@@ -222,47 +294,60 @@ class MSAModule(nn.Module):
             The output pairwise embeddings.
 
         """
-        # Set chunk sizes
+        # ---- Memory-efficient chunking configuration ----
+        # During inference, large sequences are processed in chunks to
+        # keep memory usage bounded.  The thresholds below control the
+        # chunk sizes for each sub-operation depending on sequence length.
         if not self.training:
             if z.shape[1] > const.chunk_size_threshold:
+                # Large sequence: use aggressive chunking
                 chunk_heads_pwa = True
                 chunk_size_transition_z = 64
                 chunk_size_transition_msa = 32
                 chunk_size_outer_product = 4
                 chunk_size_tri_attn = 128
             else:
+                # Moderate sequence: only chunk triangular attention
                 chunk_heads_pwa = False
                 chunk_size_transition_z = None
                 chunk_size_transition_msa = None
                 chunk_size_outer_product = None
                 chunk_size_tri_attn = 512
         else:
+            # Training: no chunking (full materialisation for gradient computation)
             chunk_heads_pwa = False
             chunk_size_transition_z = None
             chunk_size_transition_msa = None
             chunk_size_outer_product = None
             chunk_size_tri_attn = None
 
-        # Load relevant features
-        msa = feats["msa"]
-        has_deletion = feats["has_deletion"].unsqueeze(-1)
-        deletion_value = feats["deletion_value"].unsqueeze(-1)
-        is_paired = feats["msa_paired"].unsqueeze(-1)
-        msa_mask = feats["msa_mask"]
+        # ---- Load and prepare MSA-related features ----
+        msa = feats["msa"]                                    # (B, N_msa, N_tok, num_tokens) one-hot MSA rows
+        has_deletion = feats["has_deletion"].unsqueeze(-1)     # (B, N_msa, N_tok, 1) binary deletion flag
+        deletion_value = feats["deletion_value"].unsqueeze(-1) # (B, N_msa, N_tok, 1) fractional deletion count
+        is_paired = feats["msa_paired"].unsqueeze(-1)          # (B, N_msa, N_tok, 1) paired MSA indicator
+        msa_mask = feats["msa_mask"]                           # (B, N_msa, N_tok) per-row mask
         token_mask = feats["token_pad_mask"].float()
+        # Expand token_mask into a pairwise mask: (B, N_tok, N_tok)
         token_mask = token_mask[:, :, None] * token_mask[:, None, :]
 
-        # Compute MSA embeddings
+        # ---- Build initial MSA embedding m ----
+        # Concatenate per-position MSA features into a single vector per
+        # (MSA row, token) pair, then project into the MSA hidden space.
         if self.use_paired_feature:
             m = torch.cat([msa, has_deletion, deletion_value, is_paired], dim=-1)
         else:
             m = torch.cat([msa, has_deletion, deletion_value], dim=-1)
 
-        # Compute input projections
+        # Project MSA features and add the sequence-level input embedding
+        # (broadcast across MSA rows) so each row shares baseline token info.
         m = self.msa_proj(m)
         m = m + self.s_proj(emb).unsqueeze(1)
 
-        # Perform MSA blocks
+        # ---- Iteratively refine z and m through MSALayers ----
+        # Each layer updates the MSA representation m (via pair-weighted
+        # averaging with z as bias) and feeds coevolutionary signal back
+        # into z (via outer-product mean and triangle operations).
         for i in range(self.msa_blocks):
             z, m = self.layers[i](
                 z,
@@ -279,7 +364,34 @@ class MSAModule(nn.Module):
 
 
 class MSALayer(nn.Module):
-    """MSA module."""
+    """Single MSA processing layer.
+
+    Implements bidirectional communication between the MSA representation
+    *m* and the pairwise representation *z*.  The layer has three stages:
+
+    1. **MSA stack update** -- The MSA representation is refined via
+       pair-weighted averaging (where attention logits are biased by *z*)
+       followed by a transition feed-forward block.  This lets each MSA
+       row attend over positions with context from the current pairwise
+       representation.
+
+    2. **MSA-to-pairwise communication** -- An outer-product mean
+       computes a rank-one update to *z* from pairs of columns in the
+       MSA, injecting coevolutionary signal discovered in the MSA into
+       the pairwise representation.
+
+    3. **Pairwise stack update** -- The pairwise representation is
+       refined through a sequence of triangle operations:
+         * Triangle multiplication (outgoing): propagates information
+           along outgoing edges (z_ij += sum_k z_ik * z_jk).
+         * Triangle multiplication (incoming): propagates along incoming
+           edges (z_ij += sum_k z_ki * z_kj).
+         * Triangle attention (starting node): attention over rows of z,
+           with row-wise dropout.
+         * Triangle attention (ending node): attention over columns of z,
+           with column-wise dropout.
+         * A pairwise transition feed-forward block.
+    """
 
     def __init__(
         self,
@@ -371,23 +483,50 @@ class MSALayer(nn.Module):
             The output MSA embeddings.
 
         """
-        # Communication to MSA stack
+        # ================================================================
+        # Stage 1: Communication FROM pairwise stack TO MSA stack
+        # ================================================================
+        # Pair-weighted averaging: each MSA row attends over token
+        # positions, with attention logits biased by the pairwise
+        # representation z.  This allows the MSA to incorporate
+        # structural/relational context captured in z.
+        # Row-wise dropout is applied to the residual update.
         msa_dropout = get_dropout_mask(self.msa_dropout, m, self.training)
         m = m + msa_dropout * self.pair_weighted_averaging(
             m, z, token_mask, chunk_heads_pwa
         )
+        # Feed-forward transition on the MSA representation.
         m = m + self.msa_transition(m, chunk_size_transition_msa)
 
-        # Communication to pairwise stack
+        # ================================================================
+        # Stage 2: Communication FROM MSA stack TO pairwise stack
+        # ================================================================
+        # Outer-product mean: for every pair (i, j) compute the mean
+        # outer product of the MSA column vectors m[:, :, i] and
+        # m[:, :, j] across all MSA rows.  This injects coevolutionary
+        # coupling information from the MSA into the pairwise matrix z.
         z = z + self.outer_product_mean(m, msa_mask, chunk_size_outer_product)
 
-        # Compute pairwise stack
+        # ================================================================
+        # Stage 3: Pairwise stack self-refinement via triangle operations
+        # ================================================================
+        # Triangle multiplication (outgoing): updates z_ij by aggregating
+        # over intermediate nodes k using outgoing edges z_ik and z_jk.
+        # This is analogous to one step of message passing on a graph
+        # where edges share an origin.  Row-wise dropout mask applied.
         dropout = get_dropout_mask(self.z_dropout, z, self.training)
         z = z + dropout * self.tri_mul_out(z, mask=token_mask)
 
+        # Triangle multiplication (incoming): updates z_ij by aggregating
+        # over intermediate nodes k using incoming edges z_ki and z_kj.
+        # Complements outgoing multiplication by sharing the destination.
         dropout = get_dropout_mask(self.z_dropout, z, self.training)
         z = z + dropout * self.tri_mul_in(z, mask=token_mask)
 
+        # Triangle attention (starting node): self-attention along the
+        # row axis of z, where each row z[i, :] attends over all rows
+        # z[k, :] for the same column j.  Enables long-range row-wise
+        # communication in the pairwise representation.
         dropout = get_dropout_mask(self.z_dropout, z, self.training)
         z = z + dropout * self.tri_att_start(
             z,
@@ -395,6 +534,10 @@ class MSALayer(nn.Module):
             chunk_size=chunk_size_tri_attn,
         )
 
+        # Triangle attention (ending node): self-attention along the
+        # column axis of z (transposed view).  Column-wise dropout is
+        # used so entire columns are dropped together, maintaining
+        # symmetry with the starting-node attention.
         dropout = get_dropout_mask(self.z_dropout, z, self.training, columnwise=True)
         z = z + dropout * self.tri_att_end(
             z,
@@ -402,13 +545,26 @@ class MSALayer(nn.Module):
             chunk_size=chunk_size_tri_attn,
         )
 
+        # Final element-wise feed-forward transition on z.
         z = z + self.z_transition(z, chunk_size_transition_z)
 
         return z, m
 
 
 class PairformerModule(nn.Module):
-    """Pairformer module."""
+    """Pairformer module.
+
+    Iteratively refines the pairwise representation *z* (and optionally
+    the single representation *s*) through a stack of PairformerLayers.
+    Each layer applies triangle multiplication, triangle attention, a
+    pairwise transition, and (optionally) attention-with-pair-bias on
+    the single representation.
+
+    The ``no_update_z`` flag is applied only to the *last* layer in the
+    stack so that intermediate layers always update z while the final
+    layer can optionally freeze the pairwise representation (useful when
+    only the single representation is needed downstream).
+    """
 
     def __init__(
         self,
@@ -533,7 +689,19 @@ class PairformerModule(nn.Module):
 
 
 class PairformerLayer(nn.Module):
-    """Pairformer module."""
+    """Single Pairformer block.
+
+    Combines triangle operations on the pairwise representation *z* with
+    attention-with-pair-bias on the single representation *s*.  The
+    pairwise stack is identical in structure to that in MSALayer (triangle
+    multiplication outgoing/incoming, triangle attention starting/ending,
+    and a transition), while the single stack uses the refined *z* as an
+    attention bias when computing self-attention over *s*.
+
+    Flags ``no_update_s`` / ``no_update_z`` allow selectively disabling
+    updates to either representation, which is useful for ablation or
+    for the final layer when only one representation is needed.
+    """
 
     def __init__(
         self,
@@ -597,13 +765,29 @@ class PairformerLayer(nn.Module):
         chunk_size_tri_attn: int = None,
     ) -> Tuple[Tensor, Tensor]:
         """Perform the forward pass."""
-        # Compute pairwise stack
+        # ================================================================
+        # Pairwise stack: refine z through triangle operations
+        # ================================================================
+
+        # Triangle multiplication (outgoing): for each pair (i, j),
+        # aggregate information from intermediate node k via outgoing
+        # edges z_ik and z_jk.  Conceptually, this propagates relational
+        # information through triangles that share their starting node.
+        # Row-wise dropout mask ensures entire rows are dropped together.
         dropout = get_dropout_mask(self.dropout, z, self.training)
         z = z + dropout * self.tri_mul_out(z, mask=pair_mask)
 
+        # Triangle multiplication (incoming): for each pair (i, j),
+        # aggregate via incoming edges z_ki and z_kj.  This captures
+        # triangles sharing their ending node, complementing the
+        # outgoing variant above.
         dropout = get_dropout_mask(self.dropout, z, self.training)
         z = z + dropout * self.tri_mul_in(z, mask=pair_mask)
 
+        # Triangle attention (starting node): self-attention along
+        # rows of z.  For a fixed column j, row i attends to all rows
+        # k at the same column.  This enables direct long-range
+        # communication between pairs that share a starting residue.
         dropout = get_dropout_mask(self.dropout, z, self.training)
         z = z + dropout * self.tri_att_start(
             z,
@@ -611,6 +795,11 @@ class PairformerLayer(nn.Module):
             chunk_size=chunk_size_tri_attn,
         )
 
+        # Triangle attention (ending node): self-attention along
+        # columns of z (equivalently, rows of z^T).  For a fixed row i,
+        # column j attends to all columns k.  Column-wise dropout is
+        # applied to maintain the complementary symmetry with the
+        # starting-node attention above.
         dropout = get_dropout_mask(self.dropout, z, self.training, columnwise=True)
         z = z + dropout * self.tri_att_end(
             z,
@@ -618,18 +807,36 @@ class PairformerLayer(nn.Module):
             chunk_size=chunk_size_tri_attn,
         )
 
+        # Element-wise feed-forward transition on the pairwise matrix.
         z = z + self.transition_z(z)
 
-        # Compute sequence stack
+        # ================================================================
+        # Single (sequence) stack: update s using pair-biased attention
+        # ================================================================
         if not self.no_update_s:
+            # Attention with pair bias: standard multi-head self-attention
+            # on the single representation s, where the attention logits
+            # are additively biased by the (now-refined) pairwise
+            # representation z.  This allows structural and relational
+            # context captured in z to directly influence the per-token
+            # representation.
             s = s + self.attention(s, z, mask)
+            # Feed-forward transition on the single representation.
             s = s + self.transition_s(s)
 
         return s, z
 
 
 class DistogramModule(nn.Module):
-    """Distogram Module."""
+    """Distogram prediction head.
+
+    Predicts a discrete distribution over inter-residue distances from
+    the pairwise representation.  The pairwise matrix is first
+    symmetrised (z + z^T) so the predicted distogram is symmetric by
+    construction, then linearly projected to ``num_bins`` logits per
+    residue pair.  During training the resulting logits are supervised
+    against binned true C-beta distances as an auxiliary loss.
+    """
 
     def __init__(self, token_z: int, num_bins: int) -> None:
         """Initialize the distogram module.
@@ -659,5 +866,8 @@ class DistogramModule(nn.Module):
             The predicted distogram.
 
         """
+        # Symmetrise: z_ij + z_ji ensures the predicted distance
+        # distribution is the same regardless of residue ordering.
         z = z + z.transpose(1, 2)
+        # Project to distance-bin logits: (B, N_tok, N_tok, num_bins)
         return self.distogram(z)

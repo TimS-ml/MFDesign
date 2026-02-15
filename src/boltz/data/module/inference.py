@@ -1,3 +1,38 @@
+"""Inference data module for Boltz antibody design predictions.
+
+This module provides the PyTorch Lightning DataModule and Dataset for running
+inference (prediction) with the Boltz model, specifically tailored for antibody
+design tasks.
+
+Architecture overview:
+    - ``BoltzInferenceDataModule``: Lightning DataModule that creates the
+      prediction DataLoader with appropriate collation and device transfer.
+    - ``PredictionDataset``: A map-style Dataset that loads, tokenizes, and
+      featurizes individual structure records for inference.
+
+The inference pipeline for each sample:
+    1. **Load**: Read the structure NPZ and associated MSA files from disk.
+    2. **Tokenize**: Convert the structure into a token sequence using the
+       BoltzTokenizer (one token per standard residue, one per atom for
+       non-standard residues).
+    3. **Mask creation**: Build a sequence mask identifying CDR positions
+       (residues with res_type == 22, the masked/unknown token) on the
+       antibody H and L chains.
+    4. **Inpainting (optional)**: If enabled, load ground-truth coordinates
+       to provide as conditioning input. Non-CDR atoms use ground-truth
+       positions while CDR atoms are masked for the model to predict.
+    5. **Region typing**: Assign region type labels (framework, CDR, antigen)
+       to each token for region-aware attention.
+    6. **Chain typing**: Assign chain type labels (1=H-chain, 2=L-chain,
+       3=antigen) for chain-aware processing.
+    7. **Featurize**: Run the BoltzFeaturizer to produce all model input
+       tensors (pair features, MSA features, etc.).
+
+The collation function handles variable-length sequences by padding to the
+maximum length within each batch, while keeping certain metadata fields
+(symmetries, records) as lists rather than stacked tensors.
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -16,24 +51,28 @@ from boltz.data.types import MSA, Input, Manifest, Record, Structure, AntibodyIn
 from boltz.data.module.training import ab_region_type, ag_region_type
 
 def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
-    """Load the given input data.
+    """Load the structure and MSA data for a given record.
+
+    Reads the structure from a compressed NumPy file and loads any associated
+    MSA files for chains that have MSA data available.
 
     Parameters
     ----------
     record : Record
-        The record to load.
+        The record to load, containing chain metadata and file identifiers.
     target_dir : Path
-        The path to the data directory.
+        The path to the directory containing structure NPZ files.
     msa_dir : Path
-        The path to msa directory.
+        The path to the directory containing MSA NPZ files.
 
     Returns
     -------
     Input
-        The loaded input.
+        The loaded input containing the Structure and a dict of MSAs
+        keyed by chain_id.
 
     """
-    # Load the structure
+    # Load the structure from its compressed NumPy file
     structure = np.load(target_dir / f"{record.id}.npz")
     structure = Structure(
         atoms=structure["atoms"],
@@ -45,10 +84,11 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
         mask=structure["mask"],
     )
 
+    # Load MSAs for chains that have associated MSA data.
+    # msa_id == -1 indicates no MSA is available for that chain.
     msas = {}
     for chain in record.chains:
         msa_id = chain.msa_id
-        # Load the MSA for this chain, if any
         if msa_id != -1:
             msa = np.load(msa_dir / f"{msa_id}.npz")
             msas[chain.chain_id] = MSA(**msa)
@@ -57,27 +97,34 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
 
 
 def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
-    """Collate the data.
+    """Custom collation function for variable-length prediction batches.
+
+    Handles the fact that different samples may have different numbers of
+    tokens and atoms. Tensors with matching shapes are stacked directly;
+    those with mismatched shapes are padded to the maximum size.
+
+    Certain keys (metadata, symmetry info, records) are kept as lists
+    rather than stacked, since they cannot be meaningfully tensorized.
 
     Parameters
     ----------
     data : List[Dict[str, Tensor]]
-        The data to collate.
+        The list of per-sample feature dictionaries to collate.
 
     Returns
     -------
     Dict[str, Tensor]
-        The collated data.
+        The collated batch with padded/stacked tensors.
 
     """
-    # Get the keys
+    # Get the keys from the first sample (all samples have the same keys)
     keys = data[0].keys()
 
-    # Collate the data
     collated = {}
     for key in keys:
         values = [d[key] for d in data]
 
+        # These keys contain non-tensorizable metadata and are kept as lists
         if key not in [
             "all_coords",
             "all_resolved_mask",
@@ -87,21 +134,30 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
             "ligand_symmetries",
             "record",
         ]:
-            # Check if all have the same shape
+            # Check if all samples have the same tensor shape
             shape = values[0].shape
             if not all(v.shape == shape for v in values):
+                # Pad tensors to the maximum shape along dimension 0
                 values, _ = pad_to_max(values, 0)
             else:
+                # Stack directly if shapes match
                 values = torch.stack(values, dim=0)
 
-        # Stack the values
         collated[key] = values
 
     return collated
 
 
 class PredictionDataset(torch.utils.data.Dataset):
-    """Base iterable dataset."""
+    """Dataset for antibody design inference.
+
+    Each item in the dataset corresponds to a single structure record. The
+    dataset handles loading, tokenization, mask creation, optional inpainting
+    conditioning, and featurization.
+
+    Error handling: if any step fails for a record, the dataset falls back
+    to returning the first record (index 0) to avoid crashing the dataloader.
+    """
 
     def __init__(
         self,
@@ -112,16 +168,25 @@ class PredictionDataset(torch.utils.data.Dataset):
         ground_truth_dir: Optional[Path] = None,
         use_epitope: bool = True
     ) -> None:
-        """Initialize the training dataset.
+        """Initialize the prediction dataset.
 
         Parameters
         ----------
         manifest : Manifest
-            The manifest to load data from.
+            The manifest containing all records to predict.
         target_dir : Path
-            The path to the target directory.
+            The path to the directory containing structure NPZ files.
         msa_dir : Path
-            The path to the msa directory.
+            The path to the directory containing MSA NPZ files.
+        inpaint : bool, optional
+            Whether to use inpainting mode, which provides ground-truth
+            coordinates as conditioning (masking CDR atoms). Default False.
+        ground_truth_dir : Path, optional
+            Directory with ground-truth structure NPZ files (required if
+            inpaint is True).
+        use_epitope : bool, optional
+            Whether to include epitope region typing for antigen tokens.
+            Default True.
 
         """
         super().__init__()
@@ -135,40 +200,70 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.use_epitope = use_epitope
 
     def __getitem__(self, idx: int) -> dict:
-        """Get an item from the dataset.
+        """Get a featurized sample for prediction.
+
+        Loads, tokenizes, and featurizes a single structure record. For
+        antibody design, also creates CDR masks, sequence masks, region
+        type labels, and chain type labels.
+
+        Parameters
+        ----------
+        idx : int
+            The index of the record in the manifest.
 
         Returns
         -------
         Dict[str, Tensor]
-            The sampled data features.
+            The feature dictionary ready for model consumption, including:
+            - Standard Boltz features (pair, MSA, coordinates, etc.)
+            - ``masked_seq``: Token-level residue types (deep copy)
+            - ``seq_mask``: Boolean mask for CDR positions to predict
+            - ``cdr_mask``: CDR mask restricted to antibody chains
+            - ``attn_mask``: Attention mask (all True for inference)
+            - ``region_type``: Per-token region labels
+            - ``chain_type``: Per-token chain labels (1=H, 2=L, 3=antigen)
+            - ``record``: The original Record metadata
 
         """
-        # Get a sample from the dataset
+        # Get the record for this index
         record = self.manifest.records[idx]
 
-        # Get the structure
+        # ----------------------------------------------------------------
+        # Step 1: Load structure and MSA data from disk
+        # ----------------------------------------------------------------
         try:
             input_data = load_input(record, self.target_dir, self.msa_dir)
         except Exception as e:  # noqa: BLE001
             print(f"Failed to load input for {record.id} with error {e}. Skipping.")  # noqa: T201
             return self.__getitem__(0)
 
-        # Tokenize structure
+        # ----------------------------------------------------------------
+        # Step 2: Tokenize the structure
+        # ----------------------------------------------------------------
         try:
             tokenized, spec_token_mask = self.tokenizer.tokenize(input_data)
         except Exception as e:  # noqa: BLE001
             print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
             return self.__getitem__(0)
+
+        # Build sequence mask: marks positions where the model should predict
+        # the amino acid sequence. res_type == 22 is the masked/unknown token,
+        # indicating CDR positions that were masked during preprocessing.
         seq_mask = np.zeros_like(tokenized.tokens["res_type"], dtype=bool)
         if isinstance(record.structure, AntibodyInfo):
-            seq_mask[(tokenized.tokens["res_type"] == 22) & 
+            # Mark masked positions on the heavy chain
+            seq_mask[(tokenized.tokens["res_type"] == 22) &
                      (tokenized.tokens["asym_id"] == record.structure.H_chain_id)] = True
-            seq_mask[(tokenized.tokens["res_type"] == 22) & 
+            # Mark masked positions on the light chain
+            seq_mask[(tokenized.tokens["res_type"] == 22) &
                      (tokenized.tokens["asym_id"] == record.structure.L_chain_id)] = True
 
+        # ----------------------------------------------------------------
+        # Step 3 (optional): Inpainting -- load ground-truth coordinates
+        # ----------------------------------------------------------------
         if self.inpaint:
-            # Load the ground truth
             try:
+                # Load the ground-truth structure for inpainting conditioning
                 ground_truth = np.load(self.ground_truth_dir / f"{record.id}.npz")
                 ground_truth = Structure(
                     atoms=ground_truth["atoms"],
@@ -180,17 +275,23 @@ class PredictionDataset(torch.utils.data.Dataset):
                     mask=ground_truth["mask"],
                 )
 
+                # Tokenize the ground truth to align with the prediction tokens
                 ground_truth_tokens = self.tokenizer.tokenize(Input(ground_truth, {}))[0].tokens[:len(tokenized.tokens)]
 
+                # Verify that non-CDR tokens match between input and ground truth
+                # (CDR tokens may differ because they were masked in the input)
                 for i, (token, ground_truth_token) in enumerate(zip(tokenized.tokens, ground_truth_tokens)):
                     if spec_token_mask[i]:
+                        # Skip CDR tokens -- these are expected to differ
                         continue
-                
+
+                    # Non-CDR tokens should have identical structure
                     assert token["atom_num"] == ground_truth_token["atom_num"]
                     assert token["res_idx"] == ground_truth_token["res_idx"]
                     assert token["res_type"] == ground_truth_token["res_type"]
                     assert token["asym_id"] == ground_truth_token["asym_id"]
-                
+
+                # Extract per-token coordinate data from the ground truth
                 coord_data = []
                 resolved_mask = []
                 coord_mask = []
@@ -198,16 +299,24 @@ class PredictionDataset(torch.utils.data.Dataset):
                     start = token["atom_idx"]
                     end = token["atom_idx"] + token["atom_num"]
                     token_atoms = ground_truth.atoms[start:end]
+
+                    # Pad if ground truth has fewer atoms than the tokenized version
                     if len(token_atoms) < tokenized.tokens[i]["atom_num"]:
-                        token_atoms = np.concatenate([token_atoms, 
+                        token_atoms = np.concatenate([token_atoms,
                         np.zeros(tokenized.tokens[i]["atom_num"] - len(token_atoms), dtype=token_atoms.dtype)])
+
                     coord_data.append(np.array([token_atoms["coords"]]))
                     resolved_mask.append(token_atoms["is_present"])
+
                     if seq_mask[i]:
+                        # For CDR positions: mask all atoms (model must predict these)
                         coord_mask.append(np.ones_like(token_atoms["is_present"], dtype=bool))
                     else:
+                        # For non-CDR positions: use ground-truth coordinates
+                        # (mask = 1 - is_present, so present atoms are NOT masked)
                         coord_mask.append(1 - token_atoms["is_present"])
-                
+
+                # Convert to tensors
                 resolved_mask = from_numpy(np.concatenate(resolved_mask))
                 coord_mask = from_numpy(np.concatenate(coord_mask))
                 coords = from_numpy(np.concatenate(coord_data, axis=1))
@@ -215,10 +324,12 @@ class PredictionDataset(torch.utils.data.Dataset):
                 assert(len(coord_mask) == len(resolved_mask))
                 assert(len(coord_mask) == coords.shape[1])
 
+                # Center the coordinates using resolved atoms only
                 center = (coords * resolved_mask[None, :, None]).sum(dim=1)
                 center = center / resolved_mask.sum().clamp(min=1)
                 coords = coords - center[:, None]
 
+                # Pad coordinates to a multiple of 32 for efficient windowed attention
                 atoms_per_window_queries = 32
                 pad_len = (
                     (len(resolved_mask) - 1) // atoms_per_window_queries + 1
@@ -227,35 +338,53 @@ class PredictionDataset(torch.utils.data.Dataset):
                 coord_mask = pad_dim(coord_mask, 0, pad_len)
                 resolved_mask = pad_dim(resolved_mask, 0, pad_len)
             except Exception as e:
-                print(f"Failed to load ground truth for {record.id} with error {e}. Skipping.") 
+                print(f"Failed to load ground truth for {record.id} with error {e}. Skipping.")
                 return self.__getitem__(0)
         else:
+            # No inpainting: coordinates will be generated from scratch
             coords = coord_mask = resolved_mask = None
 
+        # ----------------------------------------------------------------
+        # Step 4: Assign region types for region-aware processing
+        # ----------------------------------------------------------------
         if isinstance(record.structure, AntibodyInfo):
+            # Classify each token on the H-chain as framework or CDR (H1/H2/H3)
             h_region_type = ab_region_type(tokenized.tokens, spec_token_mask, record.structure.H_chain_id)
+            # Classify each token on the L-chain as framework or CDR (L1/L2/L3)
             l_region_type = ab_region_type(tokenized.tokens, spec_token_mask, record.structure.L_chain_id)
+            # Classify antigen tokens (optionally with epitope labeling)
             ag_region_types = ag_region_type(tokenized.tokens, spec_token_mask, [record.structure.H_chain_id, record.structure.L_chain_id], self.use_epitope)
+            # Concatenate region types in chain order: H, L, then antigen
             region_type = h_region_type + l_region_type + ag_region_types
-            
+
         assert len(region_type) == len(spec_token_mask)
-        
-        # Inference specific options
+
+        # ----------------------------------------------------------------
+        # Step 5: Set up inference-specific options
+        # ----------------------------------------------------------------
         options = record.inference_options
         if options is None:
             binders, pocket = None, None
         else:
             binders, pocket = options.binders, options.pocket
 
+        # ----------------------------------------------------------------
+        # Step 6: Build CDR and chain type masks
+        # ----------------------------------------------------------------
         if isinstance(record.structure, AntibodyInfo):
+            # CDR token mask: restrict spec_token_mask to only antibody chains
             indices = [i for i, x in enumerate(tokenized.tokens) if x["asym_id"] in [record.structure.H_chain_id, record.structure.L_chain_id]]
             cdr_token_mask = np.zeros_like(spec_token_mask, dtype=bool)
             cdr_token_mask[indices] = spec_token_mask[indices]
+
+            # Chain type labels: 1 = heavy chain, 2 = light chain, 3 = antigen
             chain_type = torch.ones_like(from_numpy(tokenized.tokens["asym_id"])).long() * 3
             chain_type[tokenized.tokens["asym_id"] == record.structure.H_chain_id] = 1
             chain_type[tokenized.tokens["asym_id"] == record.structure.L_chain_id] = 2
 
-        # Compute features
+        # ----------------------------------------------------------------
+        # Step 7: Compute model input features
+        # ----------------------------------------------------------------
         try:
             features = self.featurizer.process(
                 tokenized,
@@ -273,6 +402,7 @@ class PredictionDataset(torch.utils.data.Dataset):
             print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
             return self.__getitem__(0)
 
+        # Inject inpainting ground-truth coordinates if available
         if coords is not None:
             features["coords_gt"] = coords
             features["coord_mask"] = coord_mask
@@ -280,6 +410,7 @@ class PredictionDataset(torch.utils.data.Dataset):
             features["atom_resolved_mask"] = resolved_mask
             assert features["coords"].shape == features["coords_gt"].shape
 
+        # Add antibody-specific features to the output dictionary
         features["record"] = record
         features["masked_seq"] = from_numpy(cp.deepcopy(tokenized.tokens["res_type"])).long()
         features["pdb_id"] = torch.tensor([ord(c) for c in record.id])
@@ -297,14 +428,19 @@ class PredictionDataset(torch.utils.data.Dataset):
         Returns
         -------
         int
-            The length of the dataset.
+            The number of records in the manifest.
 
         """
         return len(self.manifest.records)
 
 
 class BoltzInferenceDataModule(pl.LightningDataModule):
-    """DataModule for Boltz inference."""
+    """PyTorch Lightning DataModule for Boltz inference.
+
+    Wraps the PredictionDataset with a DataLoader configured for inference
+    (batch_size=1, no shuffling, custom collation). Handles device transfer
+    for tensor fields while keeping metadata as-is.
+    """
 
     def __init__(
         self,
@@ -320,8 +456,20 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
 
         Parameters
         ----------
-        config : DataConfig
-            The data configuration.
+        manifest : Manifest
+            The manifest containing records to predict.
+        target_dir : Path
+            Directory containing structure NPZ files.
+        msa_dir : Path
+            Directory containing MSA NPZ files.
+        num_workers : int
+            Number of data loading workers.
+        inpaint : bool, optional
+            Whether to use inpainting mode. Default False.
+        ground_truth_dir : Path, optional
+            Directory with ground-truth structures for inpainting.
+        use_epitope : bool, optional
+            Whether to include epitope region typing. Default True.
 
         """
         super().__init__()
@@ -334,12 +482,16 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         self.use_epitope = use_epitope
 
     def predict_dataloader(self) -> DataLoader:
-        """Get the training dataloader.
+        """Create the prediction DataLoader.
+
+        Returns a DataLoader with batch_size=1 (inference processes one
+        structure at a time), custom collation for variable-length padding,
+        and pinned memory for efficient GPU transfer.
 
         Returns
         -------
         DataLoader
-            The training dataloader.
+            The prediction DataLoader.
 
         """
         dataset = PredictionDataset(
@@ -365,7 +517,10 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         device: torch.device,
         dataloader_idx: int,  # noqa: ARG002
     ) -> dict:
-        """Transfer a batch to the given device.
+        """Transfer a batch to the specified device (e.g., GPU).
+
+        Moves all tensor fields to the target device, while leaving
+        non-tensor metadata fields (records, symmetries, etc.) on CPU.
 
         Parameters
         ----------
@@ -374,15 +529,16 @@ class BoltzInferenceDataModule(pl.LightningDataModule):
         device : torch.device
             The device to transfer to.
         dataloader_idx : int
-            The dataloader index.
+            The dataloader index (unused).
 
         Returns
         -------
-        np.Any
-            The transferred batch.
+        dict
+            The batch with tensor fields moved to the target device.
 
         """
         for key in batch:
+            # Skip non-tensor fields that should remain on CPU
             if key not in [
                 "all_coords",
                 "all_resolved_mask",
