@@ -140,6 +140,11 @@ class RelativePositionEncoder(Module):
         super().__init__()
         self.r_max = r_max
         self.s_max = s_max
+        # Input dimension breakdown:
+        #   2*(2*r_max+1) = 4*(r_max+1) one-hot features for residue-index and
+        #                   token-index relative distances (range [-r_max, r_max])
+        #   2*(s_max+1) one-hot features for chain symmetry distance (range [-s_max, s_max])
+        #   1 binary feature for same-entity indicator
         self.linear_layer = LinearNoBias(4 * (r_max + 1) + 2 * (s_max + 1) + 1, token_z)
 
     def forward(self, feats):

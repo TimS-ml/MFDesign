@@ -119,6 +119,10 @@ class ConfidenceModule(nn.Module):
 
         """
         super().__init__()
+        # Maximum number of atoms that any single token can represent.
+        # Standard amino acid residues have up to 14 heavy atoms, but
+        # modified residues and ligand tokens can have more. 23 covers
+        # all residue types in the CCD used by the Boltz tokenizer.
         self.max_num_atoms_per_token = 23
         self.no_update_s = pairformer_args.get("no_update_s", False)
 
